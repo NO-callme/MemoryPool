@@ -101,15 +101,74 @@ struct Config
 class SizeClass
 {
 public:
-    static constexpr size_t roundUp(size_t bytes) noexcept;
-    static constexpr size_t getIndex(size_t bytes) noexcept;
-    static constexpr size_t sizeOfIndex(size_t index) noexcept;
-    static constexpr size_t spanPagesFor(size_t blockSize, size_t blocksWanted) noexcept;
-    static constexpr bool isSmall(size_t bytes) noexcept;
+    // 向上对齐到所属大小类的块大小。
+    static constexpr size_t roundUp(size_t bytes) noexcept{
+        if (bytes == 0)
+            return Config::ALIGNMENT;
+        if (bytes <= Config::G0_MAX)
+            return alignTo(bytes, Config::G0_STEP_SHIFT);
+        if (bytes <= Config::G1_MAX)
+            return alignTo(bytes, Config::G1_STEP_SHIFT);
+        if (bytes <= Config::G2_MAX)
+            return alignTo(bytes, Config::G2_STEP_SHIFT);
+        if (bytes <= Config::G3_MAX)
+            return alignTo(bytes, Config::G3_STEP_SHIFT);
+        // 大对象按页对齐，由 PageCache 处理。
+        return alignTo(bytes, pageShift());
+    }
+
+    // 取大小类下标。调用方需保证 bytes <= MAX_SMALL_SIZE。
+    static constexpr size_t getIndex(size_t bytes) noexcept{
+        if (bytes == 0)
+            bytes = Config::ALIGNMENT;
+
+        if (bytes <= Config::G0_MAX)
+            return (bytes - 1) >> Config::G0_STEP_SHIFT;
+        if (bytes <= Config::G1_MAX)
+            return Config::G1_BASE + ((bytes - Config::G0_MAX - 1) >> Config::G1_STEP_SHIFT);
+        if (bytes <= Config::G2_MAX)
+            return Config::G2_BASE + ((bytes - Config::G1_MAX - 1) >> Config::G2_STEP_SHIFT);
+        return Config::G3_BASE + ((bytes - Config::G2_MAX - 1) >> Config::G3_STEP_SHIFT);
+    }
+
+    // 下标 -> 该大小类的块大小。反函数，用于各层内部换算。
+    static constexpr size_t sizeOfIndex(size_t index) noexcept{
+        if (index < Config::G1_BASE)
+            return (index + 1) << Config::G0_STEP_SHIFT;
+        if (index < Config::G2_BASE)
+            return Config::G0_MAX + ((index - Config::G1_BASE + 1) << Config::G1_STEP_SHIFT);
+        if (index < Config::G3_BASE)
+            return Config::G1_MAX + ((index - Config::G2_BASE + 1) << Config::G2_STEP_SHIFT);
+        return Config::G2_MAX + ((index - Config::G3_BASE + 1) << Config::G3_STEP_SHIFT);
+    }
+
+    // 该大小类切分时向 PageCache 申请多少页，保证至少能装下 blocksWanted 个块。
+    static constexpr size_t spanPagesFor(size_t blockSize, size_t blocksWanted) noexcept{
+        size_t bytes = blockSize * blocksWanted;
+        size_t pages = (bytes + Config::PAGE_SIZE - 1) / Config::PAGE_SIZE;
+        if (pages < Config::DEFAULT_SPAN_PAGES)
+            pages = Config::DEFAULT_SPAN_PAGES;
+        return pages;
+    }
+    static constexpr bool isSmall(size_t bytes) noexcept{
+        return bytes <= Config::MAX_SMALL_SIZE;
+    }
 
 private:
-    static constexpr size_t alignTo(size_t bytes, size_t shift) noexcept;
-    static constexpr size_t pageShift() noexcept;
+    static constexpr size_t alignTo(size_t bytes, size_t shift) noexcept{
+        size_t step = size_t(1) << shift;
+        return (bytes + step - 1) & ~(step - 1);
+    }
+    static constexpr size_t pageShift() noexcept{
+        size_t shift = 0;
+        size_t page = Config::PAGE_SIZE;
+        while (page > 1)
+        {
+            page >>= 1;
+            ++shift;
+        }
+        return shift;
+    }
 };
 
 // ---------------------------------------------------------------------------
