@@ -8,7 +8,7 @@ namespace mempool
 {
 
 // ============================================================================
-// PageCache：最底层，以页为单位管理内存（对应 v2 的 PageCache.h）
+// PageCache：最底层，以页为单位管理内存
 //
 // 职责：向系统申请大块内存（mmap），按需切分成 span；回收时合并相邻空闲 span。
 // 并发：粗粒度互斥锁，调用频率低，锁开销可忽略。
@@ -16,7 +16,11 @@ namespace mempool
 class PageCache
 {
 public:
-    static PageCache& getInstance() noexcept;
+    static PageCache& getInstance() noexcept
+    {
+        static PageCache instance;
+        return instance;
+    }
 
     void* allocateSpan(size_t numPages);
     void deallocateSpan(void* ptr, size_t numPages);

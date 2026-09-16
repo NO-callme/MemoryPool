@@ -1,0 +1,15 @@
+# 构建产物
+build/
+*.o
+*.obj
+*.a
+*.so
+*.exe
+
+# 编辑器
+.vscode/
+.idea/
+
+# 其他
+.cache/
+compile_commands.json
