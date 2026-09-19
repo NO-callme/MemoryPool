@@ -17,7 +17,11 @@ namespace mempool
 class CentralCache
 {
 public:
-    static CentralCache& getInstance() noexcept;
+    static CentralCache& getInstance() noexcept
+    {
+        static CentralCache instance;
+        return instance;
+    }
 
     Batch fetchRange(size_t index, size_t batchNum);
     void returnRange(size_t index, const Batch& batch);
@@ -40,6 +44,7 @@ private:
         void*    freeList = nullptr;
         size_t   count = 0;
     };
+    static_assert(sizeof(Bucket) == Config::CACHE_LINE_SIZE, "Bucket 应恰好占一个缓存行");
 
     std::array<Bucket, Config::NUM_SIZE_CLASSES> buckets_{};
 
