@@ -1,11 +1,18 @@
 // UnitTest.cpp —— 单元测试
 //
-// 当前覆盖 Common.h 里的纯逻辑：SizeClass（大小类映射）与 FreeList（侵入式链表）。
-// 对应 lyzself 的 tests/unit/test_sizeclass.cpp + test_freelist.cpp。
+// 覆盖：SizeClass（大小类映射）、FreeList（侵入式链表）、PageCache（页级管理）。
+// 对应 lyzself 的 tests/unit/test_sizeclass.cpp + test_freelist.cpp + test_pagecache.cpp。
 //
 #include "Common.h"
+#include "PageCache.h"
 #include "framework/TestFramework.h"
 
+#include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <cstring>
+#include <set>
+#include <thread>
 #include <vector>
 
 using namespace mempool;
@@ -253,6 +260,186 @@ TEST(FreeList, SplitAfterBeyondLengthKeepsListIntact)
 
     ASSERT_TRUE(rest.empty());
     ASSERT_EQ(FreeList::length(all.head), size_t(3));
+}
+
+// ============================================================================
+// PageCache
+// ============================================================================
+
+// PageCache 是单例，测试之间共享状态，因此断言都基于增量而非绝对值。
+
+TEST(PageCache, AllocateReturnsUsablePageAlignedMemory)
+{
+    PageCache& cache = PageCache::getInstance();
+
+    void* ptr = cache.allocateSpan(1);
+    ASSERT_NE(ptr, static_cast<void*>(nullptr));
+
+    // 页对齐。
+    ASSERT_EQ(reinterpret_cast<uintptr_t>(ptr) % Config::PAGE_SIZE, uintptr_t(0));
+
+    // 整页都必须真的可写。
+    std::memset(ptr, 0xAB, Config::PAGE_SIZE);
+    ASSERT_EQ(static_cast<unsigned char*>(ptr)[Config::PAGE_SIZE - 1], 0xAB);
+
+    cache.deallocateSpan(ptr, 1);
+}
+
+TEST(PageCache, ZeroPagesTreatedAsOne)
+{
+    PageCache& cache = PageCache::getInstance();
+
+    void* ptr = cache.allocateSpan(0);
+    ASSERT_NE(ptr, static_cast<void*>(nullptr));
+    cache.deallocateSpan(ptr, 1);
+}
+
+TEST(PageCache, DistinctSpansDoNotOverlap)
+{
+    PageCache& cache = PageCache::getInstance();
+    constexpr size_t COUNT = 32;
+    constexpr size_t PAGES = 2;
+
+    std::vector<void*> spans;
+    for (size_t i = 0; i < COUNT; ++i)
+    {
+        void* ptr = cache.allocateSpan(PAGES);
+        ASSERT_NE(ptr, static_cast<void*>(nullptr));
+        spans.push_back(ptr);
+    }
+
+    // 地址互不相同，且区间互不重叠。
+    std::set<void*> unique(spans.begin(), spans.end());
+    ASSERT_EQ(unique.size(), COUNT);
+
+    std::vector<char*> sorted;
+    for (void* p : spans)
+        sorted.push_back(static_cast<char*>(p));
+    std::sort(sorted.begin(), sorted.end());
+    for (size_t i = 1; i < sorted.size(); ++i)
+        ASSERT_GE(sorted[i], sorted[i - 1] + PAGES * Config::PAGE_SIZE);
+
+    // 每段都可写，确认没有把同一片内存发给两个调用方。
+    for (size_t i = 0; i < spans.size(); ++i)
+        std::memset(spans[i], static_cast<int>(i & 0xFF), PAGES * Config::PAGE_SIZE);
+    for (size_t i = 0; i < spans.size(); ++i)
+        ASSERT_EQ(static_cast<unsigned char*>(spans[i])[0], static_cast<unsigned char>(i & 0xFF));
+
+    for (void* p : spans)
+        cache.deallocateSpan(p, PAGES);
+}
+
+TEST(PageCache, FreedSpanIsReused)
+{
+    PageCache& cache = PageCache::getInstance();
+
+    // 先把空闲池预热，之后的分配都应该复用而不是继续向系统要。
+    void* warm = cache.allocateSpan(4);
+    cache.deallocateSpan(warm, 4);
+
+    size_t before = cache.totalPages();
+    for (int i = 0; i < 20; ++i)
+    {
+        void* ptr = cache.allocateSpan(4);
+        ASSERT_NE(ptr, static_cast<void*>(nullptr));
+        cache.deallocateSpan(ptr, 4);
+    }
+    ASSERT_EQ(cache.totalPages(), before); // 没有新增系统内存
+}
+
+TEST(PageCache, AdjacentSpansCoalesce)
+{
+    PageCache& cache = PageCache::getInstance();
+
+    // 切出三段相邻的小 span，全部归还后应能合并成一段大的。
+    void* a = cache.allocateSpan(2);
+    void* b = cache.allocateSpan(2);
+    void* c = cache.allocateSpan(2);
+    ASSERT_NE(a, static_cast<void*>(nullptr));
+    ASSERT_NE(b, static_cast<void*>(nullptr));
+    ASSERT_NE(c, static_cast<void*>(nullptr));
+
+    cache.deallocateSpan(a, 2);
+    cache.deallocateSpan(b, 2);
+    cache.deallocateSpan(c, 2);
+
+    size_t totalBefore = cache.totalPages();
+
+    // 若没合并，6 页的请求就得向系统另开一块。
+    void* big = cache.allocateSpan(6);
+    ASSERT_NE(big, static_cast<void*>(nullptr));
+    ASSERT_EQ(cache.totalPages(), totalBefore);
+
+    cache.deallocateSpan(big, 6);
+}
+
+TEST(PageCache, LargeSpanSplitsFromBigChunk)
+{
+    PageCache& cache = PageCache::getInstance();
+
+    // 超过 MIN_SYSTEM_PAGES 的请求也要能满足。
+    size_t pages = Config::MIN_SYSTEM_PAGES * 2;
+    void* ptr = cache.allocateSpan(pages);
+    ASSERT_NE(ptr, static_cast<void*>(nullptr));
+
+    std::memset(ptr, 0x5A, pages * Config::PAGE_SIZE);
+    cache.deallocateSpan(ptr, pages);
+}
+
+TEST(PageCache, DeallocateNullAndUnknownPointerIsSafe)
+{
+    PageCache& cache = PageCache::getInstance();
+
+    cache.deallocateSpan(nullptr, 1); // 不应崩溃
+
+    int onStack = 0;
+    cache.deallocateSpan(&onStack, 1); // 不是本层发出的地址，忽略即可
+}
+
+TEST(PageCache, DoubleFreeIsIgnored)
+{
+    PageCache& cache = PageCache::getInstance();
+
+    void* ptr = cache.allocateSpan(2);
+    cache.deallocateSpan(ptr, 2);
+
+    size_t freeBefore = cache.freePages();
+    cache.deallocateSpan(ptr, 2); // 第二次归还必须被识别并丢弃
+    ASSERT_EQ(cache.freePages(), freeBefore);
+}
+
+TEST(PageCache, ConcurrentAllocateIsSafe)
+{
+    PageCache& cache = PageCache::getInstance();
+    constexpr size_t THREADS = 4;
+    constexpr size_t PER_THREAD = 50;
+
+    std::vector<std::thread> workers;
+    std::atomic<size_t> failures{0};
+
+    for (size_t t = 0; t < THREADS; ++t)
+    {
+        workers.emplace_back([&cache, &failures]() {
+            std::vector<void*> local;
+            for (size_t i = 0; i < PER_THREAD; ++i)
+            {
+                void* ptr = cache.allocateSpan(1);
+                if (ptr == nullptr)
+                {
+                    ++failures;
+                    continue;
+                }
+                std::memset(ptr, 0xCD, Config::PAGE_SIZE);
+                local.push_back(ptr);
+            }
+            for (void* p : local)
+                cache.deallocateSpan(p, 1);
+        });
+    }
+    for (std::thread& w : workers)
+        w.join();
+
+    ASSERT_EQ(failures.load(), size_t(0));
 }
 
 int main()
