@@ -1,10 +1,13 @@
 // UnitTest.cpp —— 单元测试
 //
-// 覆盖：SizeClass（大小类映射）、FreeList（侵入式链表）、PageCache（页级管理）。
-// 对应 lyzself 的 tests/unit/test_sizeclass.cpp + test_freelist.cpp + test_pagecache.cpp。
+// 覆盖：SizeClass、FreeList、PageCache、CentralCache、ThreadCache、MemoryPool（门面）。
+// 对应 lyzself 的 tests/unit/test_*.cpp 合集。
 //
 #include "Common.h"
 #include "PageCache.h"
+#include "CentralCache.h"
+#include "ThreadCache.h"
+#include "MemoryPool.h"
 #include "framework/TestFramework.h"
 
 #include <algorithm>
@@ -12,6 +15,8 @@
 #include <cstdint>
 #include <cstring>
 #include <set>
+#include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -440,6 +445,652 @@ TEST(PageCache, ConcurrentAllocateIsSafe)
         w.join();
 
     ASSERT_EQ(failures.load(), size_t(0));
+}
+
+// ============================================================================
+// CentralCache
+// ============================================================================
+
+namespace
+{
+// 把一段 Batch 拆成指针数组，方便逐个检查。
+std::vector<void*> toVector(const Batch& batch)
+{
+    std::vector<void*> blocks;
+    void* node = batch.head;
+    while (node != nullptr)
+    {
+        blocks.push_back(node);
+        node = FreeList::next(node);
+    }
+    return blocks;
+}
+
+// 归还时需要现成的 Batch，这里从指针数组重建。
+Batch fromVector(const std::vector<void*>& blocks)
+{
+    Batch batch;
+    if (blocks.empty())
+        return batch;
+
+    for (size_t i = 0; i + 1 < blocks.size(); ++i)
+        FreeList::next(blocks[i]) = blocks[i + 1];
+    FreeList::next(blocks.back()) = nullptr;
+
+    batch.head = blocks.front();
+    batch.tail = blocks.back();
+    batch.count = blocks.size();
+    return batch;
+}
+} // namespace
+
+TEST(CentralCache, FetchReturnsRequestedBatch)
+{
+    CentralCache& cache = CentralCache::getInstance();
+    size_t index = SizeClass::getIndex(64);
+
+    Batch batch = cache.fetchRange(index, 16);
+    ASSERT_FALSE(batch.empty());
+    ASSERT_EQ(batch.count, size_t(16));
+    ASSERT_EQ(FreeList::length(batch.head), size_t(16));
+    ASSERT_EQ(FreeList::next(batch.tail), static_cast<void*>(nullptr));
+
+    cache.returnRange(index, batch);
+}
+
+TEST(CentralCache, BlocksAreDistinctAndWritable)
+{
+    CentralCache& cache = CentralCache::getInstance();
+    size_t index = SizeClass::getIndex(128);
+    size_t blockSize = SizeClass::sizeOfIndex(index);
+
+    Batch batch = cache.fetchRange(index, 32);
+    std::vector<void*> blocks = toVector(batch);
+    ASSERT_EQ(blocks.size(), size_t(32));
+
+    // 地址互不重复。
+    std::set<void*> unique(blocks.begin(), blocks.end());
+    ASSERT_EQ(unique.size(), blocks.size());
+
+    // 每块整体可写，且互不覆盖。
+    for (size_t i = 0; i < blocks.size(); ++i)
+        std::memset(blocks[i], static_cast<int>(i + 1), blockSize);
+    for (size_t i = 0; i < blocks.size(); ++i)
+    {
+        auto* bytes = static_cast<unsigned char*>(blocks[i]);
+        ASSERT_EQ(bytes[0], static_cast<unsigned char>(i + 1));
+        ASSERT_EQ(bytes[blockSize - 1], static_cast<unsigned char>(i + 1));
+    }
+
+    cache.returnRange(index, fromVector(blocks));
+}
+
+TEST(CentralCache, ReturnedBlocksComeBack)
+{
+    CentralCache& cache = CentralCache::getInstance();
+    size_t index = SizeClass::getIndex(256);
+
+    Batch batch = cache.fetchRange(index, 8);
+    std::vector<void*> original = toVector(batch);
+
+    size_t cachedBefore = cache.cachedCount(index);
+    cache.returnRange(index, fromVector(original));
+    ASSERT_EQ(cache.cachedCount(index), cachedBefore + 8);
+
+    // 再取出来应该是刚归还的那些块。
+    Batch again = cache.fetchRange(index, 8);
+    std::vector<void*> reused = toVector(again);
+    std::set<void*> originalSet(original.begin(), original.end());
+    for (void* p : reused)
+        ASSERT_TRUE(originalSet.count(p) > 0);
+
+    cache.returnRange(index, fromVector(reused));
+}
+
+TEST(CentralCache, FetchClampsToWhatExists)
+{
+    CentralCache& cache = CentralCache::getInstance();
+    size_t index = SizeClass::getIndex(512);
+
+    // 请求量远大于一个 span 能切出的块数，实际拿到多少都可以，
+    // 但计数必须与链表真实长度一致。
+    Batch batch = cache.fetchRange(index, 100000);
+    ASSERT_FALSE(batch.empty());
+    ASSERT_EQ(batch.count, FreeList::length(batch.head));
+
+    cache.returnRange(index, batch);
+}
+
+TEST(CentralCache, InvalidArgumentsAreRejected)
+{
+    CentralCache& cache = CentralCache::getInstance();
+
+    ASSERT_TRUE(cache.fetchRange(Config::NUM_SIZE_CLASSES, 4).empty());
+    ASSERT_TRUE(cache.fetchRange(0, 0).empty());
+
+    cache.returnRange(Config::NUM_SIZE_CLASSES, Batch{}); // 不应崩溃
+    cache.returnRange(0, Batch{});
+}
+
+TEST(CentralCache, LargestSizeClassYieldsAtLeastOneBlock)
+{
+    CentralCache& cache = CentralCache::getInstance();
+    size_t index = Config::NUM_SIZE_CLASSES - 1;
+    size_t blockSize = SizeClass::sizeOfIndex(index);
+
+    Batch batch = cache.fetchRange(index, 1);
+    ASSERT_FALSE(batch.empty());
+    ASSERT_GE(batch.count, size_t(1));
+
+    std::memset(batch.head, 0x11, blockSize); // 整块可写
+    cache.returnRange(index, batch);
+}
+
+TEST(CentralCache, ConcurrentFetchNeverHandsOutSameBlock)
+{
+    CentralCache& cache = CentralCache::getInstance();
+    size_t index = SizeClass::getIndex(64);
+    constexpr size_t THREADS = 4;
+    constexpr size_t ROUNDS = 100;
+    constexpr size_t BATCH = 8;
+
+    std::vector<std::thread> workers;
+    std::vector<std::vector<void*>> perThread(THREADS);
+    std::atomic<size_t> emptyFetches{0};
+
+    for (size_t t = 0; t < THREADS; ++t)
+    {
+        workers.emplace_back([&, t]() {
+            for (size_t r = 0; r < ROUNDS; ++r)
+            {
+                Batch batch = cache.fetchRange(index, BATCH);
+                if (batch.empty())
+                {
+                    ++emptyFetches;
+                    continue;
+                }
+
+                std::vector<void*> blocks = toVector(batch);
+                // 持有期间写入本线程标记，若块被重复发放会互相踩踏。
+                for (void* p : blocks)
+                    std::memset(p, static_cast<int>(t + 1), 64);
+                for (void* p : blocks)
+                {
+                    if (static_cast<unsigned char*>(p)[0] != static_cast<unsigned char>(t + 1))
+                        perThread[t].push_back(p); // 记录被踩踏的块
+                }
+
+                cache.returnRange(index, fromVector(blocks));
+            }
+        });
+    }
+    for (std::thread& w : workers)
+        w.join();
+
+    ASSERT_EQ(emptyFetches.load(), size_t(0));
+    for (size_t t = 0; t < THREADS; ++t)
+        ASSERT_TRUE(perThread[t].empty());
+}
+
+// ============================================================================
+// ThreadCache
+// ============================================================================
+
+TEST(ThreadCache, AllocateReturnsWritableBlock)
+{
+    ThreadCache& cache = ThreadCache::getInstance();
+
+    void* ptr = cache.allocate(64);
+    ASSERT_NE(ptr, static_cast<void*>(nullptr));
+
+    std::memset(ptr, 0x7E, 64);
+    ASSERT_EQ(static_cast<unsigned char*>(ptr)[63], 0x7E);
+
+    cache.deallocate(ptr, 64);
+}
+
+TEST(ThreadCache, AllocationsAreProperlyAligned)
+{
+    ThreadCache& cache = ThreadCache::getInstance();
+
+    for (size_t size : {size_t(1), size_t(8), size_t(17), size_t(100), size_t(1000)})
+    {
+        void* ptr = cache.allocate(size);
+        ASSERT_NE(ptr, static_cast<void*>(nullptr));
+        ASSERT_EQ(reinterpret_cast<uintptr_t>(ptr) % Config::ALIGNMENT, uintptr_t(0));
+        cache.deallocate(ptr, size);
+    }
+}
+
+TEST(ThreadCache, FreedBlockIsImmediatelyReused)
+{
+    ThreadCache& cache = ThreadCache::getInstance();
+
+    void* first = cache.allocate(128);
+    cache.deallocate(first, 128);
+    void* second = cache.allocate(128);
+
+    // 刚还回来的块在链表头，下一次分配应该正好拿到它。
+    ASSERT_EQ(first, second);
+    cache.deallocate(second, 128);
+}
+
+TEST(ThreadCache, LiveBlocksNeverAlias)
+{
+    ThreadCache& cache = ThreadCache::getInstance();
+    constexpr size_t COUNT = 2000;
+    constexpr size_t SIZE = 48;
+
+    std::vector<void*> blocks;
+    blocks.reserve(COUNT);
+    for (size_t i = 0; i < COUNT; ++i)
+    {
+        void* ptr = cache.allocate(SIZE);
+        ASSERT_NE(ptr, static_cast<void*>(nullptr));
+        std::memset(ptr, static_cast<int>(i & 0xFF), SIZE);
+        blocks.push_back(ptr);
+    }
+
+    std::set<void*> unique(blocks.begin(), blocks.end());
+    ASSERT_EQ(unique.size(), COUNT);
+
+    // 内容没有被后续分配覆盖，说明块之间没有重叠。
+    for (size_t i = 0; i < COUNT; ++i)
+        ASSERT_EQ(static_cast<unsigned char*>(blocks[i])[0], static_cast<unsigned char>(i & 0xFF));
+
+    for (void* p : blocks)
+        cache.deallocate(p, SIZE);
+}
+
+TEST(ThreadCache, AllSizeClassesWork)
+{
+    ThreadCache& cache = ThreadCache::getInstance();
+
+    for (size_t index = 0; index < Config::NUM_SIZE_CLASSES; ++index)
+    {
+        size_t blockSize = SizeClass::sizeOfIndex(index);
+
+        void* ptr = cache.allocate(blockSize);
+        if (ptr == nullptr)
+            MP_FAIL("大小类 " + std::to_string(index) +
+                    "（" + std::to_string(blockSize) + "B）分配失败");
+
+        std::memset(ptr, 0x33, blockSize); // 整块可写
+        cache.deallocate(ptr, blockSize);
+    }
+}
+
+TEST(ThreadCache, HighWaterTriggersReturnToCentral)
+{
+    ThreadCache& cache = ThreadCache::getInstance();
+    constexpr size_t SIZE = 32;
+    constexpr size_t COUNT = 4000; // 远超初始高水位
+
+    // 大量分配后一次性释放，桶会越过高水位并回吐给中心层。
+    std::vector<void*> blocks;
+    for (size_t i = 0; i < COUNT; ++i)
+        blocks.push_back(cache.allocate(SIZE));
+    for (void* p : blocks)
+        cache.deallocate(p, SIZE);
+
+    void* after = cache.allocate(SIZE);
+    ASSERT_NE(after, static_cast<void*>(nullptr));
+    std::memset(after, 0x01, SIZE);
+    cache.deallocate(after, SIZE);
+}
+
+TEST(ThreadCache, ReleaseAllEmptiesBucketsAndStaysUsable)
+{
+    ThreadCache& cache = ThreadCache::getInstance();
+
+    std::vector<void*> blocks;
+    for (size_t i = 0; i < 200; ++i)
+        blocks.push_back(cache.allocate(96));
+    for (void* p : blocks)
+        cache.deallocate(p, 96);
+
+    cache.releaseAll();
+
+    // 交还之后还能正常分配（会重新向中心层取货）。
+    void* ptr = cache.allocate(96);
+    ASSERT_NE(ptr, static_cast<void*>(nullptr));
+    cache.deallocate(ptr, 96);
+}
+
+TEST(ThreadCache, EachThreadHasItsOwnCache)
+{
+    ThreadCache* mainCache = &ThreadCache::getInstance();
+    ThreadCache* otherCache = nullptr;
+
+    std::thread worker([&otherCache]() {
+        otherCache = &ThreadCache::getInstance();
+    });
+    worker.join();
+
+    ASSERT_NE(mainCache, otherCache);
+}
+
+TEST(ThreadCache, ConcurrentThreadsDoNotShareBlocks)
+{
+    constexpr size_t THREADS = 4;
+    constexpr size_t PER_THREAD = 500;
+    constexpr size_t SIZE = 64;
+
+    std::vector<std::thread> workers;
+    std::vector<size_t> corrupted(THREADS, 0);
+
+    for (size_t t = 0; t < THREADS; ++t)
+    {
+        workers.emplace_back([t, &corrupted]() {
+            ThreadCache& cache = ThreadCache::getInstance();
+            std::vector<void*> blocks;
+            blocks.reserve(PER_THREAD);
+
+            for (size_t i = 0; i < PER_THREAD; ++i)
+            {
+                void* ptr = cache.allocate(SIZE);
+                std::memset(ptr, static_cast<int>(t + 1), SIZE);
+                blocks.push_back(ptr);
+            }
+
+            // 全部持有期间内容必须仍是本线程写的标记。
+            for (void* p : blocks)
+            {
+                for (size_t b = 0; b < SIZE; ++b)
+                {
+                    if (static_cast<unsigned char*>(p)[b] != static_cast<unsigned char>(t + 1))
+                    {
+                        ++corrupted[t];
+                        break;
+                    }
+                }
+            }
+
+            for (void* p : blocks)
+                cache.deallocate(p, SIZE);
+        });
+    }
+    for (std::thread& w : workers)
+        w.join();
+
+    for (size_t t = 0; t < THREADS; ++t)
+        ASSERT_EQ(corrupted[t], size_t(0));
+}
+
+// ============================================================================
+// MemoryPool（门面）
+// ============================================================================
+
+TEST(MemoryPool, AllocateAndDeallocateSmall)
+{
+    void* ptr = MemoryPool::allocate(100);
+    ASSERT_NE(ptr, static_cast<void*>(nullptr));
+    std::memset(ptr, 0x42, 100);
+    MemoryPool::deallocate(ptr, 100);
+}
+
+TEST(MemoryPool, ZeroSizeYieldsUsableBlock)
+{
+    void* ptr = MemoryPool::allocate(0);
+    ASSERT_NE(ptr, static_cast<void*>(nullptr));
+    // 至少有 ALIGNMENT 字节可写。
+    std::memset(ptr, 0x01, Config::ALIGNMENT);
+    MemoryPool::deallocate(ptr, 0);
+}
+
+TEST(MemoryPool, DeallocateNullIsNoop)
+{
+    MemoryPool::deallocate(nullptr, 100);
+    MemoryPool::deallocate(nullptr, 0);
+}
+
+TEST(MemoryPool, LargeAllocationBypassesCaches)
+{
+    size_t size = Config::MAX_SMALL_SIZE * 2; // 512KB，走大对象路径
+
+    void* ptr = MemoryPool::allocate(size);
+    ASSERT_NE(ptr, static_cast<void*>(nullptr));
+    ASSERT_EQ(reinterpret_cast<uintptr_t>(ptr) % Config::PAGE_SIZE, uintptr_t(0));
+
+    std::memset(ptr, 0x5A, size); // 整块可写
+    ASSERT_EQ(static_cast<unsigned char*>(ptr)[size - 1], 0x5A);
+
+    MemoryPool::deallocate(ptr, size);
+}
+
+TEST(MemoryPool, SizesAroundLargeThreshold)
+{
+    // 阈值两侧都要正确工作，且互不干扰。
+    for (size_t size : {Config::MAX_SMALL_SIZE - 1,
+                        Config::MAX_SMALL_SIZE,
+                        Config::MAX_SMALL_SIZE + 1})
+    {
+        void* ptr = MemoryPool::allocate(size);
+        if (ptr == nullptr)
+            MP_FAIL("size=" + std::to_string(size) + " 分配失败");
+        std::memset(ptr, 0x24, size);
+        ASSERT_EQ(static_cast<unsigned char*>(ptr)[size - 1], 0x24);
+        MemoryPool::deallocate(ptr, size);
+    }
+}
+
+TEST(MemoryPool, MixedSizesNeverAlias)
+{
+    struct Live
+    {
+        void* ptr;
+        size_t size;
+        unsigned char tag;
+    };
+
+    const size_t sizes[] = {8, 16, 17, 64, 100, 255, 256, 1000, 4096, 20000, 100000};
+    std::vector<Live> live;
+    unsigned char tag = 1;
+
+    for (int round = 0; round < 5; ++round)
+    {
+        for (size_t size : sizes)
+        {
+            void* ptr = MemoryPool::allocate(size);
+            ASSERT_NE(ptr, static_cast<void*>(nullptr));
+            std::memset(ptr, tag, size);
+            live.push_back(Live{ptr, size, tag});
+            tag = static_cast<unsigned char>(tag + 1 == 0 ? 1 : tag + 1);
+        }
+    }
+
+    // 地址唯一。
+    std::set<void*> unique;
+    for (const Live& l : live)
+        unique.insert(l.ptr);
+    ASSERT_EQ(unique.size(), live.size());
+
+    // 内容没被其他分配覆盖。
+    for (const Live& l : live)
+    {
+        auto* bytes = static_cast<unsigned char*>(l.ptr);
+        for (size_t i = 0; i < l.size; ++i)
+        {
+            if (bytes[i] != l.tag)
+                MP_FAIL("size=" + std::to_string(l.size) + " 第 " + std::to_string(i) +
+                        " 字节被覆盖");
+        }
+    }
+
+    for (const Live& l : live)
+        MemoryPool::deallocate(l.ptr, l.size);
+}
+
+namespace
+{
+struct Probe
+{
+    static int liveCount;
+    int value;
+
+    explicit Probe(int v) : value(v) { ++liveCount; }
+    ~Probe() { --liveCount; }
+};
+int Probe::liveCount = 0;
+
+struct Throwing
+{
+    Throwing() { throw std::runtime_error("boom"); }
+};
+} // namespace
+
+TEST(MemoryPool, NewElementRunsConstructorAndDestructor)
+{
+    int before = Probe::liveCount;
+
+    Probe* p = MemoryPool::newElement<Probe>(42);
+    ASSERT_NE(p, static_cast<Probe*>(nullptr));
+    ASSERT_EQ(p->value, 42);
+    ASSERT_EQ(Probe::liveCount, before + 1);
+
+    MemoryPool::deleteElement(p);
+    ASSERT_EQ(Probe::liveCount, before);
+}
+
+TEST(MemoryPool, DeleteElementNullIsNoop)
+{
+    MemoryPool::deleteElement<Probe>(nullptr);
+}
+
+TEST(MemoryPool, ThrowingConstructorDoesNotLeak)
+{
+    bool caught = false;
+    try
+    {
+        MemoryPool::newElement<Throwing>();
+    }
+    catch (const std::runtime_error&)
+    {
+        caught = true;
+    }
+    ASSERT_TRUE(caught);
+
+    // 构造失败的那块内存应已回收，后续分配仍然正常。
+    void* ptr = MemoryPool::allocate(sizeof(Throwing));
+    ASSERT_NE(ptr, static_cast<void*>(nullptr));
+    MemoryPool::deallocate(ptr, sizeof(Throwing));
+}
+
+TEST(MemoryPool, StatsTrackAllocations)
+{
+    Stats before = MemoryPool::getStats();
+
+    constexpr size_t COUNT = 100;
+    std::vector<void*> blocks;
+    for (size_t i = 0; i < COUNT; ++i)
+        blocks.push_back(MemoryPool::allocate(64));
+    for (void* p : blocks)
+        MemoryPool::deallocate(p, 64);
+
+    Stats after = MemoryPool::getStats();
+
+    ASSERT_GE(after.allocCount, before.allocCount + COUNT);
+    ASSERT_GE(after.deallocCount, before.deallocCount + COUNT);
+    ASSERT_GE(after.bytesAllocated, before.bytesAllocated + COUNT * 64);
+    ASSERT_GT(after.systemBytes, uint64_t(0));
+}
+
+TEST(MemoryPool, StlAllocatorWorksWithVector)
+{
+    std::vector<int, Allocator<int>> numbers;
+    for (int i = 0; i < 10000; ++i)
+        numbers.push_back(i);
+
+    ASSERT_EQ(numbers.size(), size_t(10000));
+    for (int i = 0; i < 10000; ++i)
+        ASSERT_EQ(numbers[static_cast<size_t>(i)], i);
+}
+
+TEST(MemoryPool, StlAllocatorWorksWithString)
+{
+    using PoolString = std::basic_string<char, std::char_traits<char>, Allocator<char>>;
+
+    PoolString s;
+    for (int i = 0; i < 1000; ++i)
+        s.push_back(static_cast<char>('a' + (i % 26)));
+
+    ASSERT_EQ(s.size(), size_t(1000));
+    ASSERT_EQ(s[0], 'a');
+}
+
+TEST(MemoryPool, ReleaseThreadCacheKeepsPoolUsable)
+{
+    std::vector<void*> blocks;
+    for (size_t i = 0; i < 500; ++i)
+        blocks.push_back(MemoryPool::allocate(72));
+    for (void* p : blocks)
+        MemoryPool::deallocate(p, 72);
+
+    MemoryPool::releaseThreadCache();
+
+    void* ptr = MemoryPool::allocate(72);
+    ASSERT_NE(ptr, static_cast<void*>(nullptr));
+    MemoryPool::deallocate(ptr, 72);
+}
+
+TEST(MemoryPool, WorksAcrossThreads)
+{
+    constexpr size_t THREADS = 4;
+    constexpr size_t PER_THREAD = 1000;
+
+    std::vector<std::thread> workers;
+    std::vector<size_t> failures(THREADS, 0);
+
+    for (size_t t = 0; t < THREADS; ++t)
+    {
+        workers.emplace_back([t, &failures]() {
+            std::vector<void*> blocks;
+            for (size_t i = 0; i < PER_THREAD; ++i)
+            {
+                size_t size = 16 + (i % 500);
+                void* ptr = MemoryPool::allocate(size);
+                if (ptr == nullptr)
+                {
+                    ++failures[t];
+                    continue;
+                }
+                std::memset(ptr, static_cast<int>(t + 1), size);
+                blocks.push_back(ptr);
+            }
+            for (size_t i = 0; i < blocks.size(); ++i)
+                MemoryPool::deallocate(blocks[i], 16 + (i % 500));
+        });
+    }
+    for (std::thread& w : workers)
+        w.join();
+
+    for (size_t t = 0; t < THREADS; ++t)
+        ASSERT_EQ(failures[t], size_t(0));
+}
+
+TEST(MemoryPool, AllocateInOneThreadFreeInAnother)
+{
+    constexpr size_t COUNT = 200;
+    constexpr size_t SIZE = 128;
+
+    std::vector<void*> blocks;
+    for (size_t i = 0; i < COUNT; ++i)
+    {
+        void* ptr = MemoryPool::allocate(SIZE);
+        ASSERT_NE(ptr, static_cast<void*>(nullptr));
+        blocks.push_back(ptr);
+    }
+
+    // 跨线程释放：块会进入另一个线程的本地桶，最终回到中心层。
+    std::thread freer([&blocks]() {
+        for (void* p : blocks)
+            MemoryPool::deallocate(p, SIZE);
+    });
+    freer.join();
+
+    void* ptr = MemoryPool::allocate(SIZE);
+    ASSERT_NE(ptr, static_cast<void*>(nullptr));
+    MemoryPool::deallocate(ptr, SIZE);
 }
 
 int main()

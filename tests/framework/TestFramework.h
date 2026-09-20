@@ -1,6 +1,6 @@
 #pragma once
 //
-// 极简单元测试框架（与 lyzself 一致）
+// 极简单元测试框架
 //
 // 环境里没有 gtest，与其引入依赖，不如用 80 行实现同样形状的 API。
 // 测试写法与 gtest 一致：TEST(Suite, Name) { ASSERT_EQ(a, b); }
